@@ -6,6 +6,10 @@
 
 #include <spdlog/spdlog.h>
 
+#include <Eigen/Sparse>
+
+#include <utility>
+
 #define VECTOR_UV(U,V) ((V)->position - (U)->position)
 
 constexpr float LAMBDA = 0.005;
@@ -168,6 +172,31 @@ float GaussianCurvature(Vertex* v) {
 	return (2 * PI<float> -angle) / area;
 }
 
+inline std::pair<Vertex*, Vertex*> WeightVertexPair(Vertex* v, Vertex* adj_v) {
+	HalfEdge* edge = adj_v->HalfEdge();
+	Vertex* alpha_v = nullptr;
+	Vertex* beta_v = nullptr;
+	while (true) {
+		if (v == edge->End()) {
+			beta_v = edge->Next()->End();
+			break;
+		}
+		else {
+			edge = edge->Pair()->Next();
+		}
+	}
+	while (true) {
+		if (v == edge->Next()->End()) {
+			alpha_v = edge->End();
+			break;
+		}
+		else {
+			edge = edge->Pair()->Next();
+		}
+	}
+	return std::make_pair(alpha_v, beta_v);
+}
+
 valf3 MeanCurvatureOperator(Vertex* v) {
 	valf3 c{ 0.0f };
 	if (v->IsOnBoundary()) return c;
@@ -175,27 +204,9 @@ valf3 MeanCurvatureOperator(Vertex* v) {
 	if (area < EPSILON<float>) return c;
 	for (Vertex* adj_v : v->AdjVertices()) {
 		// we need the vertex which is opposite to third_v
-		HalfEdge* edge = adj_v->HalfEdge();
-		Vertex* alpha_v = nullptr;
-		Vertex* beta_v = nullptr;
-		while (true) {
-			if (v == edge->End()) {
-				beta_v = edge->Next()->End();
-				break;
-			}
-			else {
-				edge = edge->Pair()->Next();
-			}
-		}
-		while (true) {
-			if (v == edge->Next()->End()) {
-				alpha_v = edge->End();
-				break;
-			}
-			else {
-				edge = edge->Pair()->Next();
-			}
-		}
+		auto temp = WeightVertexPair(v, adj_v);
+		Vertex* alpha_v = temp.first;
+		Vertex* beta_v = temp.second;
 		// if triangle facet is too small, skip it
 		if (TriangleArea(v, adj_v, beta_v) < EPSILON<float> || 
 			TriangleArea(v, adj_v, alpha_v) < EPSILON<float>) continue;
@@ -209,6 +220,60 @@ valf3 MeanCurvatureOperator(Vertex* v) {
 
 inline void MimimalSurfaceIterating(Vertex* v, float lambda) {
 	v->position = v->position + (-1.0f) * lambda * MeanCurvatureOperator(v);
+}
+
+#define MeshIndex(v) static_cast<int>(mesh->Index(v))
+
+void GlobalMiminmalSurfaceSmoothing(DenoiseData* data) {
+	// shared pointer of he mesh
+	auto mesh = data->heMesh;
+	size_t n = mesh->Vertices().size();
+	Eigen::MatrixX3f B(n, 3);
+	std::vector<Eigen::Triplet<float> > A_triplet;
+	for (auto* v : mesh->Vertices()) {
+		if (v->IsOnBoundary()) {
+			A_triplet.push_back({MeshIndex(v), MeshIndex(v), 1.0 });
+			B.row(MeshIndex(v)) = Eigen::Vector3f(v->position[0],v->position[1],v->position[2]);
+		}
+		else {
+			float w = 0.0f;
+			for (auto* adj_v : v->AdjVertices()) {
+				// we need the vertex which is opposite to third_v
+				auto temp = WeightVertexPair(v, adj_v);
+				Vertex* alpha_v = temp.first;
+				Vertex* beta_v = temp.second;
+				// now we have alpha and beta vertices, cacluate one piece
+				float cot_alpha = VECTOR_UV(alpha_v, adj_v).cot_theta(VECTOR_UV(alpha_v, v));
+				float cot_beta = VECTOR_UV(beta_v, adj_v).cot_theta(VECTOR_UV(beta_v, v));
+				A_triplet.push_back({ MeshIndex(v) , MeshIndex(adj_v), cot_alpha + cot_beta });
+				w += cot_alpha + cot_beta;
+				mesh->Index(v);
+			}
+			A_triplet.push_back({ MeshIndex(v), MeshIndex(v), -w });
+			B.row(MeshIndex(v)) = Eigen::Vector3f::Zero();
+		}
+	}
+	
+	Eigen::SparseMatrix<float> A(n, n);
+	A.setFromTriplets(A_triplet.begin(),A_triplet.end());
+	Eigen::SparseLU<Eigen::SparseMatrix<float>, Eigen::COLAMDOrdering<int> >solver;
+	solver.analyzePattern(A);
+	solver.factorize(A);
+	Eigen::MatrixXf X = solver.solve(B);
+	
+	if (solver.info() != Eigen::Success)
+	{
+		spdlog::warn("SurfaceSmoothing: Could not solve linear system\n");
+	}
+	else
+	{
+		// copy solution
+		for (auto* v : mesh->Vertices()) {
+			// vec must be a Vector3f
+			auto vec = X.row(MeshIndex(v));
+			v->position = Ubpa::pointf3{vec[0], vec[1], vec[2]};
+		}
+	}
 }
 
 void DenoiseSystem::OnUpdate(Ubpa::UECS::Schedule& schedule) {
@@ -330,6 +395,25 @@ void DenoiseSystem::OnUpdate(Ubpa::UECS::Schedule& schedule) {
 					}
 					HEMeshToMesh(data);
 					spdlog::info("Set to Minimal Surface Success");
+				}();
+			}
+
+			if (ImGui::Button("Global Miminal Surface")) {
+				[&]() {
+					if (!data->mesh) {
+						spdlog::warn("mesh is nullptr");
+						return;
+					}
+					// back up
+					data->copy = *data->mesh;
+					MeshToHEMesh(data);
+					if (!data->heMesh->IsTriMesh() || data->heMesh->IsEmpty()) {
+						spdlog::warn("HEMesh isn't triangle mesh or is empty");
+						return;
+					}
+					GlobalMiminmalSurfaceSmoothing(data);
+					HEMeshToMesh(data);
+					spdlog::info("Set to Global Minimal Surface Success");
 				}();
 			}
 
