@@ -9,6 +9,7 @@
 #include <Eigen/Sparse>
 
 #include <utility>
+#include <functional>
 
 #define VECTOR_UV(U,V) ((V)->position - (U)->position)
 
@@ -276,6 +277,107 @@ void GlobalMiminmalSurfaceSmoothing(DenoiseData* data) {
 	}
 }
 
+
+inline void get_mesh_boundary_vertices(std::shared_ptr<HEMeshX> mesh, std::vector<Vertex*>& boundaries) {
+	// external function to make sure that it at least has one half edge
+	Vertex* start, *cur, *pre=nullptr;
+	cur = start = mesh->Boundaries()[0]->End();
+	boundaries.push_back(start);
+	// advance one step
+	for (auto* v : cur->AdjVertices()) {
+		if (v->IsOnBoundary()) {
+			pre = cur;
+			cur = v;
+			break;
+		}
+	}
+	// find boundary point, the idea is travial:
+	// along one direction, only one point on the path can be boundary point,
+	// its previous and successor is determined. Why? Because that is the boundary, it has local uniqueness
+	while (cur != start) {
+		for (auto* v : cur->AdjVertices()) {
+			// v is on boundary and v is not a historical one
+			if (v->IsOnBoundary() && v != pre) {
+				pre = cur;
+				// yes, we found one and break at once
+				// because we know on one direction only one point can be boundary point
+				boundaries.push_back(pre);
+				cur = v;
+				break;
+			}
+		}
+	}
+}
+
+void empty_init(std::shared_ptr<HEMeshX> mesh, Eigen::MatrixX2f& B, float R = 1.0) {}
+
+void mean_circle_init(std::shared_ptr<HEMeshX> mesh, Eigen::MatrixX2f& B, float R = 1.0) {
+	// we assume mesh is a 2d manifold with boundary!
+	assert(mesh->HasBoundary());
+	std::vector<Vertex*> vec_of_vertex;
+	get_mesh_boundary_vertices(mesh, vec_of_vertex);
+
+	float delta_angle = 2.0f * PI<float> / static_cast<float>(vec_of_vertex.size());
+	for (auto i = 0; i < vec_of_vertex.size(); i++) {
+		B.row(MeshIndex(vec_of_vertex[i])) = Eigen::Vector2f(-R * cos(i * delta_angle), -R * sin(i * delta_angle));
+	}
+}
+
+typedef void (*init_handler)(std::shared_ptr<HEMeshX>, Eigen::MatrixX2f&, float);
+
+static init_handler BoundaryInitHander[] = { mean_circle_init, empty_init };
+
+void HarmonicMap(DenoiseData* data, int mode = 0) {
+	auto mesh = data->heMesh;
+	auto n = mesh->Vertices().size();
+	Eigen::MatrixX2f B(n,2);
+	BoundaryInitHander[mode](mesh,B,1.0);
+	std::vector<Eigen::Triplet<float> > A_triplet;
+	for (auto* v : mesh->Vertices()) {
+		if (v->IsOnBoundary()) {
+			// since vertices on boundary have been assigned on the edge of disk harmonically 
+			A_triplet.push_back({ MeshIndex(v), MeshIndex(v), 1.0 });
+		}
+		else {
+			float w = 0.0f;
+			for (auto* adj_v : v->AdjVertices()) {
+				// we need the vertex which is opposite to third_v
+				auto temp = WeightVertexPair(v, adj_v);
+				Vertex* alpha_v = temp.first;
+				Vertex* beta_v = temp.second;
+				// now we have alpha and beta vertices, cacluate one piece
+				float cot_alpha = VECTOR_UV(alpha_v, adj_v).cot_theta(VECTOR_UV(alpha_v, v));
+				float cot_beta = VECTOR_UV(beta_v, adj_v).cot_theta(VECTOR_UV(beta_v, v));
+				A_triplet.push_back({ MeshIndex(v) , MeshIndex(adj_v), cot_alpha + cot_beta });
+				w += cot_alpha + cot_beta;
+				mesh->Index(v);
+			}
+			A_triplet.push_back({ MeshIndex(v), MeshIndex(v), -w });
+			B.row(MeshIndex(v)) = Eigen::Vector2f::Zero();
+		}
+	}
+	Eigen::SparseMatrix<float> A(n, n);
+	A.setFromTriplets(A_triplet.begin(), A_triplet.end());
+	Eigen::SparseLU<Eigen::SparseMatrix<float>, Eigen::COLAMDOrdering<int> >solver;
+	solver.analyzePattern(A);
+	solver.factorize(A);
+	Eigen::MatrixXf X = solver.solve(B);
+
+	if (solver.info() != Eigen::Success)
+	{
+		spdlog::warn("SurfaceSmoothing: Could not solve linear system\n");
+	}
+	else
+	{
+		// copy solution
+		for (auto* v : mesh->Vertices()) {
+			// vec must be a Vector2f
+			auto vec = X.row(MeshIndex(v));
+			v->position = Ubpa::pointf3{ vec[0], vec[1], 0.0f };
+		}
+	}
+}
+
 void DenoiseSystem::OnUpdate(Ubpa::UECS::Schedule& schedule) {
 	schedule.RegisterCommand([](Ubpa::UECS::World* w) {
 		auto data = w->entityMngr.GetSingleton<DenoiseData>();
@@ -414,6 +516,29 @@ void DenoiseSystem::OnUpdate(Ubpa::UECS::Schedule& schedule) {
 					GlobalMiminmalSurfaceSmoothing(data);
 					HEMeshToMesh(data);
 					spdlog::info("Set to Global Minimal Surface Success");
+				}();
+			}
+
+			if (ImGui::Button("Harmonic Mapping")) {
+				[&]() {
+					if (!data->mesh) {
+						spdlog::warn("mesh is nullptr");
+						return;
+					}
+					// back up
+					data->copy = *data->mesh;
+					MeshToHEMesh(data);
+					if (!data->heMesh->IsTriMesh() || data->heMesh->IsEmpty()) {
+						spdlog::warn("HEMesh isn't triangle mesh or is empty");
+						return;
+					}
+					if (!data->heMesh->HasBoundary()) {
+						spdlog::warn("HEMesh does not have boundary, cannot apply harmonic mapping!");
+						return;
+					}
+					HarmonicMap(data, 0);
+					HEMeshToMesh(data);
+					spdlog::info("Harmonic Mapping Success");
 				}();
 			}
 
