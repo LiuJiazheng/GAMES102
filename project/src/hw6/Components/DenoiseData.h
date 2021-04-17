@@ -35,6 +35,12 @@ struct DenoiseData {
 	[[UInspector::step(0.01)]]
 	[[UInspector::tooltip("lambda")]]
 	float lambda{ 0.005f };
+
+	[[UInspector::min_value(0)]]
+	[[UInspector::max_value(2)]]
+	[[UInspector::step(1)]]
+	[[UInspector::tooltip("harmonic mapping mode")]]
+	int harmonic_mode{ 1 };
 };
 
 #include "details/DenoiseData_AutoRefl.inl"

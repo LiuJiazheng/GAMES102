@@ -323,9 +323,32 @@ void mean_circle_init(std::shared_ptr<HEMeshX> mesh, Eigen::MatrixX2f& B, float 
 	}
 }
 
+void arc_length_circle_init(std::shared_ptr<HEMeshX> mesh, Eigen::MatrixX2f& B, float R = 1.0) {
+	assert(mesh->HasBoundary());
+	std::vector<Vertex*> vec_of_vertex;
+	get_mesh_boundary_vertices(mesh, vec_of_vertex);
+
+	std::vector<float> vec_of_len;
+	float acc = 0;
+	for (auto i = 1; i < vec_of_vertex.size(); i++) {
+		float temp = vec_of_vertex[i]->position.distance(vec_of_vertex[i - 1]->position);
+		acc += temp;
+		vec_of_len.push_back(temp);
+	}
+	// final one is point n-1 v.s. point 0
+	vec_of_len.push_back(vec_of_vertex.back()->position.distance(vec_of_vertex[0]->position));
+	acc += vec_of_len.back();
+
+	float angle_now = 0.0f;
+	for (auto i = 0; i < vec_of_vertex.size(); i++) {
+		B.row(MeshIndex(vec_of_vertex[i])) = Eigen::Vector2f(-R * cos(angle_now), -R * sin(angle_now));
+		angle_now += 2.0f * PI<float> * vec_of_len[i] / acc;
+	}
+}
+
 typedef void (*init_handler)(std::shared_ptr<HEMeshX>, Eigen::MatrixX2f&, float);
 
-static init_handler BoundaryInitHander[] = { mean_circle_init, empty_init };
+static init_handler BoundaryInitHander[] = { mean_circle_init, arc_length_circle_init, empty_init };
 
 void HarmonicMap(DenoiseData* data, int mode = 0) {
 	auto mesh = data->heMesh;
@@ -536,7 +559,7 @@ void DenoiseSystem::OnUpdate(Ubpa::UECS::Schedule& schedule) {
 						spdlog::warn("HEMesh does not have boundary, cannot apply harmonic mapping!");
 						return;
 					}
-					HarmonicMap(data, 0);
+					HarmonicMap(data, data->harmonic_mode);
 					HEMeshToMesh(data);
 					spdlog::info("Harmonic Mapping Success");
 				}();
